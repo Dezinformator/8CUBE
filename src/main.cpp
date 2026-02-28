@@ -6,7 +6,7 @@
 #include <time.h>
 #include <WiFi.h>
 #include <math.h>
-#include <esp_sntp.h>   // ← добавлен для SNTP_SYNC_STATUS_COMPLETED
+#include <esp_sntp.h>
 
 // Глобальные определения
 const char* WIFI_SSID     = "SiriusAirusHaus";
@@ -78,10 +78,17 @@ void setup() {
     display_show_logo();
     delay(START_LOGO_DURATION_MS);
 
-    // Инициализация MPU
+    // Инициализация MPU (нужен до экрана выбора скина — там читаем наклон)
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(100000);
     mpu_ok = mpu_init();
+
+    // ── Экран выбора скина ────────────────────────────────────
+    // Показывается при каждом запуске после логотипа.
+    // Наклон влево/вправо — листать, короткое нажатие — выбрать.
+    ClockSkin chosen = display_select_skin(SKIN_ARCS);
+    display_set_skin(chosen);
+    Serial.printf("Skin selected: %d\n", (int)chosen);
 
     // Подключение к WiFi
     connect_wifi();
@@ -204,9 +211,12 @@ void loop() {
     }
 
     // Обновление часов
+    // Planets обновляем чаще (50мс = 20fps) для плавного движения
+    // Arcs достаточно раз в 250мс — они не анимированы покадрово
     if (currentMode == 0) {
         static unsigned long lastUpdate = 0;
-        if (millis() - lastUpdate > 250) {
+        unsigned long interval = (display_get_skin() == SKIN_PLANETS) ? 50 : 250;
+        if (millis() - lastUpdate > interval) {
             display_draw_clock();
             lastUpdate = millis();
         }

@@ -24,19 +24,32 @@ extern const char* NTP_SERVER;
 extern const long  GMT_OFFSET_SEC;
 extern const int   DAYLIGHT_OFFSET_SEC;
 
-// Параметры для тряски - значительно снижаем порог
-#define SHAKE_THRESHOLD_G      0.4f    // Было 1.1, теперь 0.4
-#define SHAKE_DETECTION_COUNT  3       // 3 тряски достаточно
-#define SHAKE_COOLDOWN_MS      300     // Минимальное время между трясками (мс)
-#define SHAKE_TIMEOUT_MS       1500    // Максимальное время для набора 3 трясок
+// Параметры для тряски
+#define SHAKE_THRESHOLD_G      0.4f
+#define SHAKE_DETECTION_COUNT  3
+#define SHAKE_COOLDOWN_MS      300
+#define SHAKE_TIMEOUT_MS       1500
 
 // Параметры кнопки
 #define LONG_PRESS_MS          1800
 #define SHORT_PRESS_MS         1500
 
 // Параметры обновления
-#define WEATHER_UPDATE_INTERVAL 600000UL     // 10 минут
+#define WEATHER_UPDATE_INTERVAL 600000UL
 #define START_LOGO_DURATION_MS  2500
+
+// Порог наклона для выбора скина на экране Select UI (~23°)
+#define TILT_THRESHOLD         0.4f
+
+// ── Скины экрана часов ───────────────────────────────────────
+// Добавить новый скин: 1) добавить значение в enum
+//                      2) обновить SKIN_COUNT
+//                      3) реализовать в display.cpp
+enum ClockSkin {
+    SKIN_ARCS    = 0,   // Дуги прогресса (классика)
+    SKIN_PLANETS = 1,   // Планеты на орбитах
+};
+#define SKIN_COUNT  2
 
 // Magic 8-Ball ответы
 extern const char* answers[];

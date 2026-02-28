@@ -1,6 +1,7 @@
 #include "display.h"
 #include "weather.h"
 #include "config.h"
+#include "mpu.h"                 // ← для mpu_read_accel на экране выбора скина
 #include "weather_icons.h"   // ← Пиксель-арт иконки погоды (PROGMEM)
 #include <Arduino.h>
 #include <math.h>
@@ -9,6 +10,9 @@
 
 // Глобальный объект дисплея
 Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_RST);
+
+// Forward declaration — функция определена ниже, но используется раньше
+static uint16_t blendColor565(uint16_t a, uint16_t b, float t);
 
 // ============================================================
 // КЭШ ДЛЯ ОПТИМИЗАЦИИ ПЕРЕРИСОВКИ
@@ -25,6 +29,19 @@ static int last_date_year = -1;
 static float last_sec_progress = 0.0f;
 static float last_min_progress = 0.0f;
 static float last_hour_progress = 0.0f;
+
+// Кэш позиций планет (скин PLANETS)
+static float last_planet_sec_angle  = -999.0f;
+static float last_planet_min_angle  = -999.0f;
+static float last_planet_hour_angle = -999.0f;
+
+// Флаги однократной инициализации скина PLANETS
+static bool planets_stars_drawn  = false;
+static bool planets_orbits_drawn = false;
+static bool planets_calibrated   = false;
+static unsigned long planets_sec_off  = 0;
+static unsigned long planets_min_off  = 0;
+static unsigned long planets_hour_off = 0;
 
 // ============================================================
 // ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: рисуем иконку из PROGMEM
@@ -149,15 +166,41 @@ void display_clear() {
     last_sec_progress = 0.0f;
     last_min_progress = 0.0f;
     last_hour_progress = 0.0f;
+
+    // Сброс кэша планет — при смене скина или пробуждении
+    // орбиты перерисуются заново
+    last_planet_sec_angle  = -999.0f;
+    last_planet_min_angle  = -999.0f;
+    last_planet_hour_angle = -999.0f;
+
+    // Сброс флагов скина PLANETS — звёзды и орбиты перерисуются,
+    // калибровка времени пересчитается при следующем входе
+    planets_stars_drawn  = false;
+    planets_orbits_drawn = false;
+    planets_calibrated   = false;
 }
 
 // ============================================================
-// ЭКРАН ЧАСОВ — палитра ГАЛАКТИКА
+// АКТИВНЫЙ СКИН — устанавливается из main.cpp
+// ============================================================
+
+static ClockSkin activeSkin = SKIN_ARCS;
+
+void display_set_skin(ClockSkin skin) {
+    activeSkin = skin;
+}
+
+ClockSkin display_get_skin() {
+    return activeSkin;
+}
+
+// ============================================================
+// СКИН 1: ARCS — дуги прогресса (палитра ГАЛАКТИКА)
 // Дуги: Секундная cyan r=110 t=4, Минутная green r=100 t=6,
 //        Часовая magenta r=88 t=8
 // ============================================================
 
-void display_draw_clock() {
+static void clock_draw_arcs() {
     struct tm timeinfo;
 
     if (!getLocalTime(&timeinfo)) {
@@ -257,7 +300,436 @@ void display_draw_clock() {
 }
 
 // ============================================================
-// ЭКРАН ПОГОДЫ — пиксель-арт иконки из PROGMEM
+// СКИН 2: PLANETS — планеты на орбитах
+//
+// Три точки летят по круговым орбитам:
+//   Секунды — маленькая яркая точка, внешняя орбита r=108
+//   Минуты  — средняя точка,         средняя орбита  r=88
+//   Часы    — большая точка,          внутренняя орбита r=66
+//
+// За каждой планетой тянется хвост (след из затухающих точек).
+// В центре — цифры ЧЧ:ММ и дата, как в скине ARCS.
+// ============================================================
+
+// Рисует планету с хвостом на орбите.
+// angle — текущий угол в радианах (0 = верх, по часовой)
+// r_orbit — радиус орбиты
+// planet_r — радиус точки-планеты
+// color — цвет планеты
+// tail_steps — количество точек хвоста
+// step_angle — угловой шаг хвоста (радианы)
+static void drawPlanet(float angle, int r_orbit, int planet_r,
+                       uint16_t color, int tail_steps, float step_angle) {
+    const int cx = 120, cy = 120;
+
+    // Рисуем хвост от старого к новому (дальний хвост тусклее)
+    for (int i = tail_steps; i >= 1; i--) {
+        float tail_angle = angle - i * step_angle;
+        int tx = cx + (int)(r_orbit * sin(tail_angle));
+        int ty = cy - (int)(r_orbit * cos(tail_angle));
+        float fade = 1.0f - (float)i / (tail_steps + 1);
+        uint16_t tail_color = blendColor565(GC9A01A_BLACK, color, fade * 0.45f);
+        tft.fillCircle(tx, ty, planet_r - 1, tail_color);
+    }
+
+    // Рисуем планету
+    int px = cx + (int)(r_orbit * sin(angle));
+    int py = cy - (int)(r_orbit * cos(angle));
+    tft.fillCircle(px, py, planet_r, color);
+
+    // Блик
+    if (planet_r >= 3) {
+        uint16_t highlight = blendColor565(color, GC9A01A_WHITE, 0.35f);
+        tft.fillCircle(px - 1, py - 1, planet_r / 2, highlight);
+    }
+}
+
+// Стирает только самый дальний хвостовой пиксель и восстанавливает орбиту под ним.
+// Вызывается ПЕРЕД drawPlanet с предыдущим углом.
+// Это намного быстрее чем стирать всё и перерисовывать.
+static void erasePlanetTail(float old_angle, int r_orbit, int planet_r,
+                            int tail_steps, float step_angle, uint16_t orbitColor) {
+    const int cx = 120, cy = 120;
+    int erase_r = planet_r;  // без запаса — точно по размеру
+
+    // Стираем только самую дальнюю точку хвоста (остальные перекроет новый хвост)
+    float tail_end_angle = old_angle - tail_steps * step_angle;
+    int tx = cx + (int)(r_orbit * sin(tail_end_angle));
+    int ty = cy - (int)(r_orbit * cos(tail_end_angle));
+    tft.fillCircle(tx, ty, erase_r, GC9A01A_BLACK);
+
+    // Восстанавливаем орбиту в том месте где стёрли — только нужные пиксели
+    // Рисуем маленький дуговой патч вместо полного круга
+    for (float a = tail_end_angle - 0.08f; a <= tail_end_angle + 0.08f; a += 0.02f) {
+        int ox = cx + (int)(r_orbit * sin(a));
+        int oy = cy - (int)(r_orbit * cos(a));
+        tft.drawPixel(ox, oy, orbitColor);
+    }
+
+    // Стираем также старую голову планеты (она сдвинулась)
+    float head_angle = old_angle;
+    int hx = cx + (int)(r_orbit * sin(head_angle));
+    int hy = cy - (int)(r_orbit * cos(head_angle));
+    tft.fillCircle(hx, hy, erase_r + 1, GC9A01A_BLACK);
+
+    // Восстанавливаем орбиту под старой головой
+    for (float a = head_angle - 0.12f; a <= head_angle + 0.12f; a += 0.02f) {
+        int ox = cx + (int)(r_orbit * sin(a));
+        int oy = cy - (int)(r_orbit * cos(a));
+        tft.drawPixel(ox, oy, orbitColor);
+    }
+}
+
+static void clock_draw_planets() {
+    struct tm timeinfo;
+
+    if (!getLocalTime(&timeinfo)) {
+        tft.fillRect(0, 0, 240, 240, GC9A01A_BLACK);
+        tft.setTextColor(GC9A01A_RED);
+        tft.setCursor(40, 100);
+        tft.setTextSize(2);
+        tft.println("No time");
+        return;
+    }
+
+    // ── Параметры орбит ────────────────────────────────────────
+    const int   SEC_R    = 108;  const int SEC_PR   = 4;
+    const int   SEC_TAIL = 6;    const float SEC_STEP = 0.10f;
+
+    const int   MIN_R    = 88;   const int MIN_PR   = 5;
+    const int   MIN_TAIL = 4;    const float MIN_STEP = 0.07f;
+
+    const int   HOUR_R   = 66;   const int HOUR_PR  = 7;
+    const int   HOUR_TAIL= 3;    const float HOUR_STEP = 0.06f;
+
+    const uint16_t ORBIT_COLOR = 0x18C3;
+
+    // ── Звёзды — рисуем один раз при старте ───────────────────
+    // 38 точек вне орбит и вне зоны цифр (центр экрана)
+    struct Star { uint8_t x, y, r; };
+    static const Star stars[] = {
+        {20,55,1},{45,30,1},{70,18,2},{110,12,1},{145,22,1},
+        {175,40,2},{200,25,1},{220,60,1},{228,90,1},{225,125,1},
+        {218,158,2},{205,185,1},{185,208,1},{155,220,2},{120,228,1},
+        {88,222,1},{58,210,2},{35,192,1},{18,168,1},{12,135,1},
+        {15,100,2},{22,72,1},{38,48,1},{160,15,1},{195,55,2},
+        {215,95,1},{210,140,2},{190,175,1},{165,200,1},{130,215,2},
+        {95,210,1},{62,195,2},{40,170,1},{25,142,1},{30,78,2},
+        {52,52,1},{82,28,2},{178,32,1},
+    };
+    static const int STAR_COUNT = 38;
+
+    static bool blinkOff = false;
+    static int  blinkIdx = 0;
+    static unsigned long lastBlink = 0;
+
+    if (!planets_stars_drawn) {
+        for (int i = 0; i < STAR_COUNT; i++) {
+            tft.fillCircle(stars[i].x, stars[i].y, stars[i].r, GC9A01A_WHITE);
+        }
+        planets_stars_drawn = true;
+    }
+
+    // ── Мерцание: каждые 600мс одна звезда гаснет/загорается ──
+    if (millis() - lastBlink > 1800) {
+        // Восстанавливаем предыдущую
+        tft.fillCircle(stars[blinkIdx].x, stars[blinkIdx].y,
+                       stars[blinkIdx].r, GC9A01A_WHITE);
+        // Выбираем следующую (детерминированно)
+        blinkIdx = (blinkIdx + 7) % STAR_COUNT;
+        blinkOff = !blinkOff;
+        uint16_t c = blinkOff ? GC9A01A_BLACK : GC9A01A_WHITE;
+        tft.fillCircle(stars[blinkIdx].x, stars[blinkIdx].y,
+                       stars[blinkIdx].r, c);
+        lastBlink = millis();
+    }
+
+    // ── Орбиты — один раз при старте ──────────────────────────
+    if (!planets_orbits_drawn) {
+        tft.drawCircle(120, 120, SEC_R,  ORBIT_COLOR);
+        tft.drawCircle(120, 120, MIN_R,  ORBIT_COLOR);
+        tft.drawCircle(120, 120, HOUR_R, ORBIT_COLOR);
+        planets_orbits_drawn = true;
+    }
+
+    // ── Углы: millis() + offset от реального времени ──────────
+    // При первом вызове один раз вычисляем offset так, чтобы
+    // планеты стартовали с позиции соответствующей текущему времени,
+    // а дальше двигались плавно через millis() без скачков.
+    if (!planets_calibrated) {
+        unsigned long real_sec  = (unsigned long)timeinfo.tm_sec * 1000UL;
+        unsigned long real_min  = ((unsigned long)timeinfo.tm_min  * 60UL
+                                 + (unsigned long)timeinfo.tm_sec) * 1000UL;
+        unsigned long real_hour = (((unsigned long)(timeinfo.tm_hour % 12) * 3600UL)
+                                 + ((unsigned long)timeinfo.tm_min  * 60UL)
+                                 + (unsigned long)timeinfo.tm_sec) * 1000UL;
+
+        unsigned long ms0 = millis();
+        planets_sec_off  = (60000UL       + real_sec  - ms0 % 60000UL)    % 60000UL;
+        planets_min_off  = (3600000UL     + real_min  - ms0 % 3600000UL)  % 3600000UL;
+        planets_hour_off = (43200000UL    + real_hour - ms0 % 43200000UL) % 43200000UL;
+
+        planets_calibrated = true;
+        Serial.printf("Planets calibrated: %02d:%02d:%02d\n",
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+
+    unsigned long ms = millis();
+    float sec_angle  = (float)((ms + planets_sec_off)  % 60000UL)    / 60000.0f    * 2.0f * PI;
+    float min_angle  = (float)((ms + planets_min_off)  % 3600000UL)  / 3600000.0f  * 2.0f * PI;
+    float hour_angle = (float)((ms + planets_hour_off) % 43200000UL) / 43200000.0f * 2.0f * PI;
+
+    // ── Стираем хвосты точечно ────────────────────────────────
+    if (last_planet_sec_angle > -900.0f) {
+        erasePlanetTail(last_planet_sec_angle,  SEC_R,  SEC_PR,  SEC_TAIL,  SEC_STEP,  ORBIT_COLOR);
+        erasePlanetTail(last_planet_min_angle,  MIN_R,  MIN_PR,  MIN_TAIL,  MIN_STEP,  ORBIT_COLOR);
+        erasePlanetTail(last_planet_hour_angle, HOUR_R, HOUR_PR, HOUR_TAIL, HOUR_STEP, ORBIT_COLOR);
+    }
+
+    // ── Рисуем планеты ────────────────────────────────────────
+    drawPlanet(hour_angle, HOUR_R, HOUR_PR, GC9A01A_MAGENTA, HOUR_TAIL, HOUR_STEP);
+    drawPlanet(min_angle,  MIN_R,  MIN_PR,  GC9A01A_GREEN,   MIN_TAIL,  MIN_STEP);
+    drawPlanet(sec_angle,  SEC_R,  SEC_PR,  GC9A01A_CYAN,    SEC_TAIL,  SEC_STEP);
+
+    last_planet_sec_angle  = sec_angle;
+    last_planet_min_angle  = min_angle;
+    last_planet_hour_angle = hour_angle;
+
+    // ── Цифры в центре (ЧЧ:ММ) ────────────────────────────────
+    char buf[10];
+    int cur_sec = timeinfo.tm_sec;
+
+    if (timeinfo.tm_hour != last_hour) {
+        tft.fillRect(60, 92, 50, 32, GC9A01A_BLACK);
+        strftime(buf, sizeof(buf), "%H", &timeinfo);
+        tft.setTextColor(GC9A01A_MAGENTA);
+        tft.setTextSize(4);
+        tft.setCursor(60, 92);
+        tft.print(buf);
+        last_hour = timeinfo.tm_hour;
+    }
+
+    // Двоеточие мигает
+    tft.fillRect(107, 92, 14, 32, GC9A01A_BLACK);
+    tft.setTextColor(GC9A01A_CYAN);
+    tft.setTextSize(4);
+    tft.setCursor(107, 92);
+    tft.print((cur_sec % 2 == 0) ? ":" : " ");
+    last_sec = cur_sec;
+
+    if (timeinfo.tm_min != last_min) {
+        tft.fillRect(121, 92, 50, 32, GC9A01A_BLACK);
+        strftime(buf, sizeof(buf), "%M", &timeinfo);
+        tft.setTextColor(GC9A01A_GREEN);
+        tft.setTextSize(4);
+        tft.setCursor(121, 92);
+        tft.print(buf);
+        last_min = timeinfo.tm_min;
+    }
+
+    // ── Дата ──────────────────────────────────────────────────
+    if (timeinfo.tm_mday != last_date_day ||
+        timeinfo.tm_mon  != last_date_month ||
+        timeinfo.tm_year != last_date_year) {
+
+        tft.fillRect(50, 138, 140, 16, GC9A01A_BLACK);
+        strftime(buf, sizeof(buf), "%d.%m.%y", &timeinfo);
+        tft.setTextColor(GC9A01A_WHITE);
+        tft.setTextSize(2);
+        int textWidth = strlen(buf) * 6 * 2;
+        tft.setCursor(120 - textWidth / 2, 138);
+        tft.print(buf);
+
+        last_date_day   = timeinfo.tm_mday;
+        last_date_month = timeinfo.tm_mon;
+        last_date_year  = timeinfo.tm_year;
+    }
+}
+
+// ============================================================
+// ДИСПЕТЧЕР ЧАСОВ — вызывает нужный скин
+// ============================================================
+
+void display_draw_clock() {
+    switch (activeSkin) {
+        case SKIN_PLANETS: clock_draw_planets(); break;
+        case SKIN_ARCS:
+        default:           clock_draw_arcs();    break;
+    }
+}
+
+// ============================================================
+// ЭКРАН ВЫБОРА СКИНА
+// Вызывается один раз при старте, после логотипа.
+// Управление: наклон влево/вправо — листать, короткое нажатие — выбрать.
+// Возвращает выбранный ClockSkin.
+// ============================================================
+
+// Рисует превью одного скина на экране выбора
+static void drawSkinPreview(ClockSkin skin, bool selected) {
+    tft.fillScreen(GC9A01A_BLACK);
+
+    const int cx = 120, cy = 105;
+
+    if (skin == SKIN_ARCS) {
+        // Превью ARCS: три незамкнутые дуги + цифры
+        // Рисуем статичную картинку — 75% каждой дуги для наглядности
+        uint16_t colors[3]   = { GC9A01A_CYAN, GC9A01A_GREEN, GC9A01A_MAGENTA };
+        int      radii[3]    = { 80, 68, 55 };
+        int      thickness[3]= { 4, 6, 8 };
+
+        for (int i = 0; i < 3; i++) {
+            float end = 0.75f - i * 0.15f;  // у каждой дуги разный прогресс
+            for (float a = -90.0f; a < -90.0f + end * 360.0f; a += 1.5f) {
+                float rad = a * PI / 180.0f;
+                int r_o = radii[i] + thickness[i] / 2;
+                int r_i = radii[i] - thickness[i] / 2;
+                int x1 = cx + r_o * cos(rad), y1 = cy + r_o * sin(rad);
+                int x2 = cx + r_i * cos(rad), y2 = cy + r_i * sin(rad);
+                tft.drawLine(x1, y1, x2, y2, colors[i]);
+            }
+        }
+        // Цифры-заглушка по центру
+        tft.setTextColor(GC9A01A_MAGENTA);
+        tft.setTextSize(3);
+        tft.setCursor(cx - 33, cy - 16);
+        tft.print("12");
+        tft.setTextColor(GC9A01A_CYAN);
+        tft.print(":");
+        tft.setTextColor(GC9A01A_GREEN);
+        tft.print("00");
+
+    } else {
+        // Превью PLANETS: три орбиты с точками
+        uint16_t orbitColor = 0x2104;
+        tft.drawCircle(cx, cy, 80, orbitColor);
+        tft.drawCircle(cx, cy, 62, orbitColor);
+        tft.drawCircle(cx, cy, 44, orbitColor);
+
+        // Планеты в красивых позициях
+        tft.fillCircle(cx + 80,  cy,      3, GC9A01A_CYAN);
+        tft.fillCircle(cx - 44,  cy - 44, 4, GC9A01A_GREEN);
+        tft.fillCircle(cx + 31,  cy - 31, 5, GC9A01A_MAGENTA);
+
+        // Хвостики
+        for (int t = 1; t <= 5; t++) {
+            float a = t * 0.1f;
+            int tx = cx + (int)(80 * cos(-a));
+            int ty = cy + (int)(80 * sin(-a));
+            uint16_t tc = blendColor565(GC9A01A_BLACK, GC9A01A_CYAN, 0.4f - t * 0.06f);
+            tft.fillCircle(tx, ty, 2, tc);
+        }
+
+        // Цифры в центре
+        tft.setTextColor(GC9A01A_MAGENTA);
+        tft.setTextSize(3);
+        tft.setCursor(cx - 33, cy - 16);
+        tft.print("12");
+        tft.setTextColor(GC9A01A_CYAN);
+        tft.print(":");
+        tft.setTextColor(GC9A01A_GREEN);
+        tft.print("00");
+    }
+
+    // ── Название скина ─────────────────────────────────────────
+    const char* names[SKIN_COUNT] = { "ARCS", "PLANETS" };
+    uint16_t nameColor = selected ? GC9A01A_WHITE : 0x7BEF;
+
+    tft.setTextSize(2);
+    tft.setTextColor(nameColor);
+    const char* name = names[(int)skin];
+    int nw = strlen(name) * 12;
+    tft.setCursor(120 - nw / 2, 172);
+    tft.print(name);
+
+    // ── Стрелки навигации ──────────────────────────────────────
+    tft.setTextColor(0x4208);  // тёмно-серый
+    tft.setTextSize(2);
+    tft.setCursor(24, 172);
+    tft.print("<");
+    tft.setCursor(204, 172);
+    tft.print(">");
+
+    // ── Подсказка снизу ────────────────────────────────────────
+    tft.setTextSize(1);
+    tft.setTextColor(0x4208);
+    const char* hint = "tilt to browse  tap to select";
+    tft.setCursor(120 - (strlen(hint) * 6 / 2), 200);
+    tft.print(hint);
+
+    // ── Рамка вокруг превью если выбран ───────────────────────
+    if (selected) {
+        tft.drawCircle(cx, cy, 91, GC9A01A_CYAN);
+        tft.drawCircle(cx, cy, 92, blendColor565(GC9A01A_BLACK, GC9A01A_CYAN, 0.4f));
+    }
+}
+
+ClockSkin display_select_skin(ClockSkin current) {
+    ClockSkin selected = current;
+    drawSkinPreview(selected, true);
+
+    unsigned long lastTiltCheck = 0;
+    bool          lastTiltLeft  = false;
+    bool          lastTiltRight = false;
+
+    // Кнопка: ждём отпускания если уже зажата
+    while (digitalRead(TOUCH_PIN) == HIGH) delay(10);
+    unsigned long btnPressStart = 0;
+    bool          btnWasHigh    = false;
+
+    Serial.println("=== SELECT SKIN ===");
+
+    while (true) {
+
+        // ── Наклон: листаем скины ──────────────────────────────
+        if (mpu_ok && millis() - lastTiltCheck > 200) {
+            float gx, gy, gz;
+            mpu_read_accel(gx, gy, gz);
+
+            bool tiltRight = (gy >  TILT_THRESHOLD);
+            bool tiltLeft  = (gy < -TILT_THRESHOLD);
+
+            // Срабатываем только на новый наклон (не держание)
+            if (tiltRight && !lastTiltRight) {
+                selected = (ClockSkin)(((int)selected + 1) % SKIN_COUNT);
+                drawSkinPreview(selected, true);
+                Serial.printf("Skin → %d\n", (int)selected);
+            } else if (tiltLeft && !lastTiltLeft) {
+                selected = (ClockSkin)(((int)selected - 1 + SKIN_COUNT) % SKIN_COUNT);
+                drawSkinPreview(selected, true);
+                Serial.printf("Skin ← %d\n", (int)selected);
+            }
+
+            lastTiltRight = tiltRight;
+            lastTiltLeft  = tiltLeft;
+            lastTiltCheck = millis();
+        }
+
+        // ── Кнопка: короткое нажатие = подтвердить ────────────
+        int btn = digitalRead(TOUCH_PIN);
+
+        if (btn == HIGH && !btnWasHigh) {
+            btnPressStart = millis();
+            btnWasHigh    = true;
+        }
+
+        if (btn == LOW && btnWasHigh) {
+            unsigned long dur = millis() - btnPressStart;
+            if (dur > 30 && dur < LONG_PRESS_MS) {
+                // Короткое нажатие — выбрать
+                Serial.printf("Skin SELECTED: %d\n", (int)selected);
+                break;
+            }
+            btnWasHigh = false;
+        }
+
+        delay(20);
+    }
+
+    return selected;
+}
+
+
 //
 // МАКЕТ (круглый экран 240x240):
 //   Иконка 64x64   → центр X=120, верх Y=28  (x=88, y=28)
