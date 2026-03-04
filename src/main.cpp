@@ -54,8 +54,9 @@ bool needRedraw    = true;
 
 unsigned long lastWeatherUpdate    = 0;
 unsigned long lastDiagnosticOutput = 0;
-unsigned long lastNtpRetry         = 0;   // последняя попытка NTP
-int           ntpAttempt           = 0;   // счётчик попыток
+unsigned long lastNtpRetry         = 0;
+unsigned long lastWifiRetry        = 0;   // последняя попытка переподключения WiFi
+int           ntpAttempt           = 0;
 
 // ============================================================
 // ТАЙМЕР — каждые 5 мс
@@ -84,17 +85,21 @@ void IRAM_ATTR onTimer(void* arg) {
 
     // ── Антидребезг кнопки ────────────────────────────────────
     bool raw = (digitalRead(TOUCH_PIN) == HIGH);
+
     if (raw == btn_state) {
         btn_counter = 0;
     } else {
         btn_counter++;
         if (btn_counter >= 4) {
+            // 4 одинаковых чтения подряд — переход подтверждён
             btn_state   = raw;
             btn_counter = 0;
 
             if (btn_state) {
+                // Передний фронт — начало нажатия
                 btn_press_start = now_ms;
             } else {
+                // Задний фронт — конец нажатия
                 unsigned long dur = now_ms - btn_press_start;
                 if (dur > 50 && dur < (unsigned long)LONG_PRESS_MS) {
                     // Короткое нажатие — считаем для тройного
@@ -187,6 +192,50 @@ void tryNtpSync() {
 }
 
 // Проверяет и обновляет статус NTP — вызывается в loop()
+// Фоновое переподключение к WiFi — вызывается в loop()
+void updateWifiStatus() {
+    bool connected = (WiFi.status() == WL_CONNECTED);
+
+    if (connected && !wifi_ok) {
+        // Только что подключились (или восстановили соединение)
+        wifi_ok = true;
+        Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+        static bool web_started = false;
+        if (!web_started) {
+            web_init();
+            web_started = true;
+        }
+        // Сбрасываем NTP чтобы пересинхронизировать
+        time_synced = false;
+        ntpAttempt  = 0;
+        display_set_time_status("NTP sync #1...");
+        tryNtpSync();
+        lastNtpRetry = millis();
+        update_weather();
+        lastWeatherUpdate = millis();
+        if (currentMode == 1) needRedraw = true;
+        return;
+    }
+
+    if (!connected) {
+        if (wifi_ok) {
+            // Только что потеряли соединение
+            wifi_ok     = false;
+            time_synced = false;
+            Serial.println("WiFi: connection lost");
+            display_set_time_status("No WiFi");
+        }
+        // Повторная попытка каждые 20 секунд
+        if (millis() - lastWifiRetry > 20000) {
+            Serial.println("WiFi: retrying...");
+            WiFi.disconnect();
+            delay(100);
+            connect_wifi();
+            lastWifiRetry = millis();
+        }
+    }
+}
+
 void updateNtpStatus() {
     if (time_synced) return;
     if (WiFi.status() != WL_CONNECTED) {
@@ -293,27 +342,11 @@ void setup() {
     display_set_skin(chosen);
     Serial.printf("Skin selected: %d\n", (int)chosen);
 
-    // WiFi — пробуем подключиться но не блокируем
+    // WiFi — первая попытка подключения.
+    // Если не удалось — updateWifiStatus() в loop() будет повторять каждые 20 сек.
     display_set_time_status("WiFi...");
     connect_wifi();
-
-    if (WiFi.status() == WL_CONNECTED) {
-        wifi_ok = true;
-        Serial.println("WiFi OK");
-
-        // Запускаем веб-сервер
-        web_init();
-
-        display_set_time_status("NTP sync #1...");
-        tryNtpSync();
-        lastNtpRetry = millis();
-
-        update_weather();
-        lastWeatherUpdate = millis();
-    } else {
-        Serial.println("WiFi FAILED — starting without network");
-        display_set_time_status("No WiFi");
-    }
+    // Результат обработает updateWifiStatus() при первом вызове в loop()
 
     randomSeed(analogRead(0));
 
@@ -346,8 +379,8 @@ void loop() {
         lastDiagnosticOutput = millis();
     }
 
-    // ── Фоновое отслеживание NTP ──────────────────────────────
-    // Работает всегда, не только в режиме часов
+    // ── Фоновое переподключение WiFi и отслеживание NTP ──────
+    updateWifiStatus();
     updateNtpStatus();
 
     // ── Три длинных нажатия → режим точки доступа (AP) ───────

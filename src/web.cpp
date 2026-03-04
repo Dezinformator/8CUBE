@@ -261,6 +261,10 @@ void web_start_ap() {
 
 // Вызывается из setup() если ap_mode флаг был установлен.
 // Стартует чистый AP без конфликтов с STA стеком.
+// Forward declarations
+static void web_register_routes();
+static void web_init_server_internal();
+
 void web_run_ap_mode() {
     const char* AP_SSID = "8th-CUBE";
 
@@ -480,5 +484,4 @@ void web_init() {
     web_init_server_internal();
     Serial.printf("Web UI: http://%s  pwd: %s\n",
                   WiFi.localIP().toString().c_str(), webPassword.c_str());
-}
 }

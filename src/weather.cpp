@@ -13,42 +13,53 @@ String description = "";
 
 void connect_wifi() {
     Preferences p;
+
+    // Собираем список всех сетей: сначала сохранённые, потом хардкод как запасная
+    struct Network { String ssid; String pwd; };
+    Network nets[6];
+    int total = 0;
+
+    // Сохранённые сети из Preferences
     p.begin("8cube", true);
     int count = p.getInt("wifi_count", 0);
+    for (int i = 0; i < count && total < 5; i++) {
+        String s = p.getString(("wssid" + String(i)).c_str(), "");
+        String pw = p.getString(("wpwd"  + String(i)).c_str(), "");
+        if (s.length() > 0) {
+            nets[total++] = {s, pw};
+        }
+    }
     p.end();
 
-    // Если нет сохранённых сетей — пробуем хардкод из main.cpp
-    if (count == 0) {
-        Serial.printf("WiFi: trying hardcoded SSID: %s\n", WIFI_SSID);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-        uint8_t cnt = 0;
-        while (WiFi.status() != WL_CONNECTED && cnt++ < 30) delay(400);
-        return;
+    // Хардкод — всегда добавляем если его ещё нет в списке
+    bool found = false;
+    for (int i = 0; i < total; i++) {
+        if (nets[i].ssid == String(WIFI_SSID)) { found = true; break; }
+    }
+    if (!found && total < 6) {
+        nets[total++] = {String(WIFI_SSID), String(WIFI_PASSWORD)};
     }
 
-    // Перебираем сохранённые сети
-    for (int i = 0; i < count; i++) {
-        p.begin("8cube", true);
-        String ssid = p.getString(("wssid" + String(i)).c_str(), "");
-        String pwd  = p.getString(("wpwd"  + String(i)).c_str(), "");
-        p.end();
+    if (total == 0) return;
 
-        if (ssid.length() == 0) continue;
-
-        Serial.printf("WiFi: trying [%d] %s\n", i, ssid.c_str());
-        WiFi.begin(ssid.c_str(), pwd.c_str());
+    // Перебираем все сети
+    for (int i = 0; i < total; i++) {
+        Serial.printf("WiFi: trying [%d/%d] %s\n", i+1, total, nets[i].ssid.c_str());
+        WiFi.begin(nets[i].ssid.c_str(), nets[i].pwd.c_str());
 
         uint8_t cnt = 0;
         while (WiFi.status() != WL_CONNECTED && cnt++ < 20) delay(400);
 
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("WiFi: connected to %s\n", ssid.c_str());
+            Serial.printf("WiFi: connected to %s  IP: %s\n",
+                nets[i].ssid.c_str(), WiFi.localIP().toString().c_str());
             return;
         }
-        Serial.printf("WiFi: failed [%d] %s\n", i, ssid.c_str());
+        Serial.printf("WiFi: no response from %s\n", nets[i].ssid.c_str());
         WiFi.disconnect();
         delay(200);
     }
+    Serial.println("WiFi: all networks failed");
 }
 
 // ============================================================
