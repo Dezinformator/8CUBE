@@ -22,6 +22,15 @@ static int last_min = -1;
 static int last_hour = -1;
 static int last_sec = -1;
 
+// Статус NTP для отображения пока время не синхронизировано
+static char ntp_status[32] = "Connecting...";
+static bool time_synced = false;
+
+void display_set_time_status(const char* status) {
+    strncpy(ntp_status, status, sizeof(ntp_status) - 1);
+    ntp_status[sizeof(ntp_status) - 1] = '\0';
+}
+
 static int last_date_day = -1;
 static int last_date_month = -1;
 static int last_date_year = -1;
@@ -42,6 +51,12 @@ static bool planets_calibrated   = false;
 static unsigned long planets_sec_off  = 0;
 static unsigned long planets_min_off  = 0;
 static unsigned long planets_hour_off = 0;
+// Таймеры последней отрисовки медленных планет.
+// Инициализируем большим числом чтобы при первом кадре
+// условие (millis() - timer >= interval) сразу сработало,
+// независимо от того сколько мс прошло с момента включения.
+static unsigned long planets_last_min_draw  = 0xFFFFFFFF - 20000UL;
+static unsigned long planets_last_hour_draw = 0xFFFFFFFF - 70000UL;
 
 // ============================================================
 // ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: рисуем иконку из PROGMEM
@@ -150,6 +165,55 @@ void display_show_logo() {
     tft.print("CUBE");
 }
 
+// ── Экран режима точки доступа ────────────────────────────────
+// Показывается после тройного длинного нажатия.
+// Инструкция: подключись к сети и открой 192.168.4.1
+void display_show_ap_screen() {
+    tft.fillScreen(GC9A01A_BLACK);
+
+    // Заголовок
+    tft.setTextColor(GC9A01A_CYAN);
+    tft.setTextSize(2);
+    tft.setCursor(52, 30);
+    tft.print("AP MODE");
+
+    // Разделитель
+    tft.drawFastHLine(30, 55, 180, 0x2945);
+
+    // WiFi иконка — простые дуги
+    const int cx = 120, cy = 90;
+    tft.drawCircle(cx, cy, 28, GC9A01A_CYAN);
+    tft.drawCircle(cx, cy, 18, GC9A01A_CYAN);
+    tft.drawCircle(cx, cy, 8,  GC9A01A_CYAN);
+    tft.fillCircle(cx, cy, 3,  GC9A01A_WHITE);
+
+    // SSID
+    tft.setTextColor(GC9A01A_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(34, 120);
+    tft.print("8th-CUBE");
+
+    // Подсказка — открытая сеть
+    tft.setTextColor(0x7BEF);
+    tft.setTextSize(1);
+    tft.setCursor(52, 145);
+    tft.print("open network");
+
+    // Разделитель
+    tft.drawFastHLine(30, 158, 180, 0x2945);
+
+    // IP адрес
+    tft.setTextColor(GC9A01A_CYAN);
+    tft.setTextSize(1);
+    tft.setCursor(50, 168);
+    tft.print("open in browser:");
+
+    tft.setTextColor(GC9A01A_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(28, 183);
+    tft.print("192.168.4.1");
+}
+
 // ============================================================
 // ОЧИСТКА ЭКРАНА
 // ============================================================
@@ -178,6 +242,9 @@ void display_clear() {
     planets_stars_drawn  = false;
     planets_orbits_drawn = false;
     planets_calibrated   = false;
+    // Принудительно перерисовать все планеты в первом же кадре после clear
+    planets_last_min_draw  = 0xFFFFFFFF - 20000UL;
+    planets_last_hour_draw = 0xFFFFFFFF - 70000UL;
 }
 
 // ============================================================
@@ -200,15 +267,34 @@ ClockSkin display_get_skin() {
 //        Часовая magenta r=88 t=8
 // ============================================================
 
+// Экран ожидания NTP — показывает --:-- и статус подключения
+static void drawNoTime() {
+    // Рисуем только при изменении статуса (не каждый кадр)
+    static char last_status[32] = "";
+    if (strcmp(last_status, ntp_status) == 0) return;
+    strncpy(last_status, ntp_status, sizeof(last_status) - 1);
+
+    tft.fillScreen(GC9A01A_BLACK);
+
+    // --:-- по центру серым
+    tft.setTextColor(0x4208);   // тёмно-серый
+    tft.setTextSize(5);
+    tft.setCursor(55, 95);
+    tft.print("--:--");
+
+    // Статус NTP снизу
+    tft.setTextColor(GC9A01A_CYAN);
+    tft.setTextSize(1);
+    int sw = strlen(ntp_status) * 6;
+    tft.setCursor(120 - sw / 2, 155);
+    tft.print(ntp_status);
+}
+
 static void clock_draw_arcs() {
     struct tm timeinfo;
 
     if (!getLocalTime(&timeinfo)) {
-        tft.fillRect(0, 0, 240, 240, GC9A01A_BLACK);
-        tft.setTextColor(GC9A01A_RED);
-        tft.setCursor(40, 100);
-        tft.setTextSize(2);
-        tft.println("No time");
+        drawNoTime();
         return;
     }
 
@@ -384,11 +470,7 @@ static void clock_draw_planets() {
     struct tm timeinfo;
 
     if (!getLocalTime(&timeinfo)) {
-        tft.fillRect(0, 0, 240, 240, GC9A01A_BLACK);
-        tft.setTextColor(GC9A01A_RED);
-        tft.setCursor(40, 100);
-        tft.setTextSize(2);
-        tft.println("No time");
+        drawNoTime();
         return;
     }
 
@@ -431,7 +513,7 @@ static void clock_draw_planets() {
     }
 
     // ── Мерцание: каждые 600мс одна звезда гаснет/загорается ──
-    if (millis() - lastBlink > 1800) {
+    if (millis() - lastBlink > 600) {
         // Восстанавливаем предыдущую
         tft.fillCircle(stars[blinkIdx].x, stars[blinkIdx].y,
                        stars[blinkIdx].r, GC9A01A_WHITE);
@@ -479,21 +561,41 @@ static void clock_draw_planets() {
     float min_angle  = (float)((ms + planets_min_off)  % 3600000UL)  / 3600000.0f  * 2.0f * PI;
     float hour_angle = (float)((ms + planets_hour_off) % 43200000UL) / 43200000.0f * 2.0f * PI;
 
-    // ── Стираем хвосты точечно ────────────────────────────────
+    // ── Определяем какие планеты нужно обновить ───────────────
+    // Секунды — каждый кадр (50мс): движение заметно глазу
+    // Минуты  — раз в 10 секунд: за 10 сек смещение ~1°, незаметно
+    // Часы    — раз в 60 секунд: двигаются крайне медленно
+    // Значение 0 → условие срабатывает сразу (первый кадр после clear)
+    bool update_sec  = true;
+    bool update_min  = (millis() - planets_last_min_draw  >= 10000);
+    bool update_hour = (millis() - planets_last_hour_draw >= 60000);
+
+    // ── Стираем только те планеты что будем перерисовывать ────
     if (last_planet_sec_angle > -900.0f) {
-        erasePlanetTail(last_planet_sec_angle,  SEC_R,  SEC_PR,  SEC_TAIL,  SEC_STEP,  ORBIT_COLOR);
-        erasePlanetTail(last_planet_min_angle,  MIN_R,  MIN_PR,  MIN_TAIL,  MIN_STEP,  ORBIT_COLOR);
-        erasePlanetTail(last_planet_hour_angle, HOUR_R, HOUR_PR, HOUR_TAIL, HOUR_STEP, ORBIT_COLOR);
+        if (update_sec)
+            erasePlanetTail(last_planet_sec_angle,  SEC_R,  SEC_PR,  SEC_TAIL,  SEC_STEP,  ORBIT_COLOR);
+        if (update_min)
+            erasePlanetTail(last_planet_min_angle,  MIN_R,  MIN_PR,  MIN_TAIL,  MIN_STEP,  ORBIT_COLOR);
+        if (update_hour)
+            erasePlanetTail(last_planet_hour_angle, HOUR_R, HOUR_PR, HOUR_TAIL, HOUR_STEP, ORBIT_COLOR);
     }
 
-    // ── Рисуем планеты ────────────────────────────────────────
-    drawPlanet(hour_angle, HOUR_R, HOUR_PR, GC9A01A_MAGENTA, HOUR_TAIL, HOUR_STEP);
-    drawPlanet(min_angle,  MIN_R,  MIN_PR,  GC9A01A_GREEN,   MIN_TAIL,  MIN_STEP);
-    drawPlanet(sec_angle,  SEC_R,  SEC_PR,  GC9A01A_CYAN,    SEC_TAIL,  SEC_STEP);
-
-    last_planet_sec_angle  = sec_angle;
-    last_planet_min_angle  = min_angle;
-    last_planet_hour_angle = hour_angle;
+    // ── Рисуем только нужные планеты ─────────────────────────
+    // Порядок: сначала медленные (под быстрыми), потом секунды сверху
+    if (update_hour) {
+        drawPlanet(hour_angle, HOUR_R, HOUR_PR, GC9A01A_MAGENTA, HOUR_TAIL, HOUR_STEP);
+        last_planet_hour_angle = hour_angle;
+        planets_last_hour_draw = millis();
+    }
+    if (update_min) {
+        drawPlanet(min_angle,  MIN_R,  MIN_PR,  GC9A01A_GREEN,   MIN_TAIL,  MIN_STEP);
+        last_planet_min_angle = min_angle;
+        planets_last_min_draw = millis();
+    }
+    if (update_sec) {
+        drawPlanet(sec_angle,  SEC_R,  SEC_PR,  GC9A01A_CYAN,    SEC_TAIL,  SEC_STEP);
+        last_planet_sec_angle = sec_angle;
+    }
 
     // ── Цифры в центре (ЧЧ:ММ) ────────────────────────────────
     char buf[10];
@@ -758,25 +860,16 @@ void display_draw_weather() {
     // ── Выбор иконки по коду weather_id ───────────────────
     const uint16_t* icon = icon_sunny;  // по умолчанию
 
-    if (weather_id == 800) {
-        icon = icon_sunny;
-    } else if (weather_id == 801) {
-        icon = icon_few_clouds;
-    } else if (weather_id == 802) {
-        icon = icon_scattered;
-    } else if (weather_id == 803) {
-        icon = icon_broken;
-    } else if (weather_id == 804) {
-        icon = icon_overcast;
-    } else if (weather_id >= 200 && weather_id < 300) {
-        icon = icon_thunder;
-    } else if (weather_id >= 600 && weather_id < 700) {
-        icon = icon_snow;   // Снег (600-699) — проверяем ДО дождя
-    } else if (weather_id >= 300 && weather_id < 600) {
-        icon = icon_rain;   // Дождь и морось (300-599)
-    } else {
-        // Туман, дымка, прочее → показываем overcast
-        icon = icon_overcast;
+    switch (weather_id) {
+        case WX_SUNNY:      icon = icon_sunny;       break;
+        case WX_FEW_CLOUDS: icon = icon_few_clouds;  break;
+        case WX_SCATTERED:  icon = icon_scattered;   break;
+        case WX_BROKEN:     icon = icon_broken;      break;
+        case WX_OVERCAST:   icon = icon_overcast;    break;
+        case WX_RAIN:       icon = icon_rain;        break;
+        case WX_SNOW:       icon = icon_snow;        break;
+        case WX_THUNDER:    icon = icon_thunder;     break;
+        default:              icon = icon_overcast;    break;
     }
 
     // ── Рисуем иконку ──────────────────────────────────────
@@ -833,7 +926,7 @@ void display_draw_weather() {
     // ── Название города ────────────────────────────────────
     tft.setTextSize(1);
     tft.setTextColor(0x7BEF);  // серый
-    String cityStr = String(CITY);
+    String cityStr = String(WEATHER_CITY);
     cityStr.toUpperCase();
     int cityWidth = cityStr.length() * 6;
     int cityX = 120 - cityWidth / 2;
